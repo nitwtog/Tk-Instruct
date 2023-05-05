@@ -135,40 +135,24 @@ class DataCollatorForNI:
             else:
                 sources.append(self.tokenizer.decode(tokenized_source[:self.max_source_length], skip_special_tokens=True))
 
+
+        new_source = []
+        for k,ex in enumerate(batch):
+            labels = random.choice(ex["Instance"]["output"])
+            new_source.append(sources[k] + labels)
+
         if self.text_only:
             model_inputs = {"inputs": sources}
         else:
             model_inputs = self.tokenizer(
-                sources, 
+                new_source,
                 max_length=self.max_source_length, 
                 padding=self.padding,
                 return_tensors=self.return_tensors, 
                 truncation=True,
                 pad_to_multiple_of=self.pad_to_multiple_of)
 
-        if "output" in batch[0]["Instance"] and batch[0]["Instance"]["output"]:
-            # Randomly select one reference if multiple are provided.
-            labels = [random.choice(ex["Instance"]["output"]) for ex in batch]
-            if self.text_only:
-                model_inputs["labels"] = labels
-            else:
-                with self.tokenizer.as_target_tokenizer():
-                    labels = self.tokenizer(
-                        labels,
-                        max_length=self.max_target_length,
-                        padding=self.padding,
-                        return_tensors=self.return_tensors,
-                        truncation=True,
-                        pad_to_multiple_of=self.pad_to_multiple_of
-                    )
-                label_mask = labels["attention_mask"].bool()
-                model_inputs["labels"] = labels["input_ids"].masked_fill(~label_mask, self.label_pad_token_id)
-        else:
-            model_inputs["labels"] = None
+        label_mask = model_inputs["attention_mask"].bool()
+        model_inputs["labels"] = model_inputs["input_ids"].masked_fill(~label_mask, self.label_pad_token_id)
 
-        # prepare decoder_input_ids
-        if self.model is not None and hasattr(self.model, "prepare_decoder_input_ids_from_labels") and not self.text_only:
-            decoder_input_ids = self.model.prepare_decoder_input_ids_from_labels(labels=model_inputs["labels"])
-            model_inputs["decoder_input_ids"] = decoder_input_ids
-            
         return model_inputs

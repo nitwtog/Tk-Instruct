@@ -53,8 +53,14 @@ from ni_collator import DataCollatorForNI
 from ni_trainer import NITrainer, DenserEvalCallback
 from compute_metrics import compute_metrics, compute_grouped_metrics
 
+import  transformers
+from transformers.models.bloom import BloomForCausalLM
+import torch
+
 set_progress_bar_enabled(False)
 logger = logging.getLogger(__name__)
+os.environ['WANDB_DISABLED'] = "True"
+
 
 try:
     nltk.data.find("tokenizers/punkt")
@@ -309,7 +315,7 @@ def main():
 
     # Get the NaturalInstructions dataset
     raw_datasets = load_dataset(
-        "src/ni_dataset.py", 
+        "/workspace/Tk-Instruct-main/src/ni_dataset.py",
         data_dir=data_args.data_dir, 
         task_dir=data_args.task_dir, 
         cache_dir=model_args.cache_dir,
@@ -322,20 +328,52 @@ def main():
     # Distributed training:
     # The .from_pretrained methods guarantee that only one local process can concurrently
     # download model & vocab.
-    config = AutoConfig.from_pretrained(
-        model_args.config_name if model_args.config_name else model_args.model_name_or_path,
-        cache_dir=model_args.cache_dir,
-        revision=model_args.model_revision,
-        use_auth_token=True if model_args.use_auth_token else None,
-    )
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
-        cache_dir=model_args.cache_dir,
-        use_fast=model_args.use_fast_tokenizer,
-        revision=model_args.model_revision,
-        use_auth_token=True if model_args.use_auth_token else None,
-    )
-    model = AutoModelForSeq2SeqLM.from_pretrained(
+    if 'llama' in model_args.model_name_or_path.lower():
+        config = AutoConfig.from_pretrained(
+            model_args.model_name_or_path,
+            cache_dir=model_args.cache_dir,
+            revision=model_args.model_revision,
+            use_auth_token=True if model_args.use_auth_token else None,
+        )
+    else:
+        config = AutoConfig.from_pretrained(
+            model_args.config_name if model_args.config_name else model_args.model_name_or_path,
+            cache_dir=model_args.cache_dir,
+            revision=model_args.model_revision,
+            use_auth_token=True if model_args.use_auth_token else None,
+        )
+
+    if 'llama' in model_args.model_name_or_path.lower():
+        tokenizer = transformers.LlamaTokenizer.from_pretrained(
+            model_args.model_name_or_path,
+            cache_dir = model_args.cache_dir,
+            use_fast = model_args.use_fast_tokenizer,
+            revision = model_args.model_revision,
+            use_auth_token = True if model_args.use_auth_token else None,
+        )
+        tokenizer.bos_token = 1
+        tokenizer.eos_token = 2
+        tokenizer.pad_token = 1
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
+            cache_dir=model_args.cache_dir,
+            use_fast=model_args.use_fast_tokenizer,
+            revision=model_args.model_revision,
+            use_auth_token=True if model_args.use_auth_token else None,
+        )
+
+    if 'bloom' in model_args.model_name_or_path.lower():
+        model_class = BloomForCausalLM
+        tokenizer.padding_side = 'left'
+    elif 'llama' in model_args.model_name_or_path.lower():  # add llama
+        model_class = transformers.LlamaForCausalLM
+        # model_class = LlamaForCausalLM_with_lossmask
+        tokenizer.padding_side = 'left'
+    else:
+        model_class = AutoModelForSeq2SeqLM
+
+    model = model_class.from_pretrained(
         model_args.model_name_or_path,
         from_tf=bool(".ckpt" in model_args.model_name_or_path),
         config=config,
@@ -346,55 +384,55 @@ def main():
 
     model.resize_token_embeddings(len(tokenizer))
 
-    if model.config.decoder_start_token_id is None and isinstance(tokenizer, (MBartTokenizer, MBartTokenizerFast)):
-        if isinstance(tokenizer, MBartTokenizer):
-            model.config.decoder_start_token_id = tokenizer.lang_code_to_id[data_args.lang]
-        else:
-            model.config.decoder_start_token_id = tokenizer.convert_tokens_to_ids(data_args.lang)
-
-    if model.config.decoder_start_token_id is None:
-        raise ValueError("Make sure that `config.decoder_start_token_id` is correctly defined")
-
-    if (
-        hasattr(model.config, "max_position_embeddings")
-        and model.config.max_position_embeddings < data_args.max_source_length
-    ):
-        if model_args.resize_position_embeddings is None:
-            logger.warning(
-                f"Increasing the model's number of position embedding vectors from {model.config.max_position_embeddings} "
-                f"to {data_args.max_source_length}."
-            )
-            model.resize_position_embeddings(data_args.max_source_length)
-        elif model_args.resize_position_embeddings:
-            model.resize_position_embeddings(data_args.max_source_length)
-        else:
-            raise ValueError(
-                f"`--max_source_length` is set to {data_args.max_source_length}, but the model only has {model.config.max_position_embeddings}"
-                f" position encodings. Consider either reducing `--max_source_length` to {model.config.max_position_embeddings} or to automatically "
-                "resize the model's position encodings by passing `--resize_position_embeddings`."
-            )
-
-    if isinstance(tokenizer, tuple(MULTILINGUAL_TOKENIZERS)):
-        assert (
-            data_args.lang is not None
-        ), f"{tokenizer.__class__.__name__} is a multilingual tokenizer which requires --lang argument"
-
-        tokenizer.src_lang = data_args.lang
-        tokenizer.tgt_lang = data_args.lang
-
-        # For multilingual translation models like mBART-50 and M2M100 we need to force the target language token
-        # as the first generated token. We ask the user to explicitly provide this as --forced_bos_token argument.
-        forced_bos_token_id = (
-            tokenizer.lang_code_to_id[data_args.forced_bos_token] if data_args.forced_bos_token is not None else None
-        )
-        model.config.forced_bos_token_id = forced_bos_token_id
-
-
-    if training_args.label_smoothing_factor > 0 and not hasattr(model, "prepare_decoder_input_ids_from_labels"):
-        logger.warning(
-            "label_smoothing is enabled but the `prepare_decoder_input_ids_from_labels` method is not defined for"
-            f"`{model.__class__.__name__}`. This will lead to loss being calculated twice and will take up more memory"
-        )
+    # if model.config.decoder_start_token_id is None and isinstance(tokenizer, (MBartTokenizer, MBartTokenizerFast)):
+    #     if isinstance(tokenizer, MBartTokenizer):
+    #         model.config.decoder_start_token_id = tokenizer.lang_code_to_id[data_args.lang]
+    #     else:
+    #         model.config.decoder_start_token_id = tokenizer.convert_tokens_to_ids(data_args.lang)
+    #
+    # if model.config.decoder_start_token_id is None:
+    #     raise ValueError("Make sure that `config.decoder_start_token_id` is correctly defined")
+    #
+    # if (
+    #     hasattr(model.config, "max_position_embeddings")
+    #     and model.config.max_position_embeddings < data_args.max_source_length
+    # ):
+    #     if model_args.resize_position_embeddings is None:
+    #         logger.warning(
+    #             f"Increasing the model's number of position embedding vectors from {model.config.max_position_embeddings} "
+    #             f"to {data_args.max_source_length}."
+    #         )
+    #         model.resize_position_embeddings(data_args.max_source_length)
+    #     elif model_args.resize_position_embeddings:
+    #         model.resize_position_embeddings(data_args.max_source_length)
+    #     else:
+    #         raise ValueError(
+    #             f"`--max_source_length` is set to {data_args.max_source_length}, but the model only has {model.config.max_position_embeddings}"
+    #             f" position encodings. Consider either reducing `--max_source_length` to {model.config.max_position_embeddings} or to automatically "
+    #             "resize the model's position encodings by passing `--resize_position_embeddings`."
+    #         )
+    #
+    # if isinstance(tokenizer, tuple(MULTILINGUAL_TOKENIZERS)):
+    #     assert (
+    #         data_args.lang is not None
+    #     ), f"{tokenizer.__class__.__name__} is a multilingual tokenizer which requires --lang argument"
+    #
+    #     tokenizer.src_lang = data_args.lang
+    #     tokenizer.tgt_lang = data_args.lang
+    #
+    #     # For multilingual translation models like mBART-50 and M2M100 we need to force the target language token
+    #     # as the first generated token. We ask the user to explicitly provide this as --forced_bos_token argument.
+    #     forced_bos_token_id = (
+    #         tokenizer.lang_code_to_id[data_args.forced_bos_token] if data_args.forced_bos_token is not None else None
+    #     )
+    #     model.config.forced_bos_token_id = forced_bos_token_id
+    #
+    #
+    # if training_args.label_smoothing_factor > 0 and not hasattr(model, "prepare_decoder_input_ids_from_labels"):
+    #     logger.warning(
+    #         "label_smoothing is enabled but the `prepare_decoder_input_ids_from_labels` method is not defined for"
+    #         f"`{model.__class__.__name__}`. This will lead to loss being calculated twice and will take up more memory"
+    #     )
 
     if training_args.do_train:
         if "train" not in raw_datasets:
@@ -523,8 +561,11 @@ def main():
         logger.info("*** Predict ***")
 
         predict_results = trainer.predict(
-            predict_dataset, metric_key_prefix="predict", max_length=max_length, num_beams=num_beams
+            # predict_dataset, metric_key_prefix="predict", max_length=max_length, num_beams=num_beams
+            predict_dataset, max_length=max_length, num_beams=num_beams
         )
+        predict_results.predictions = torch.where(predict_results.predictions < 0, tokenizer.pad_token, predict_results.predictions)
+
         metrics = predict_results.metrics
         max_predict_samples = (
             data_args.max_predict_samples if data_args.max_predict_samples is not None else len(predict_dataset)

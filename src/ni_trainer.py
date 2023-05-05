@@ -240,9 +240,9 @@ class NITrainer(Seq2SeqTrainer):
 
         # XXX: adapt synced_gpus for fairscale as well
         gen_kwargs = {
-            "max_length": self._max_length if self._max_length is not None else self.model.config.max_length,
-            "num_beams": self._num_beams if self._num_beams is not None else self.model.config.num_beams,
-            "synced_gpus": True if is_deepspeed_zero3_enabled() else False,
+            "max_new_tokens": 128,
+            "num_beams": 1,
+            "synced_gpus": False,
         }
 
         if "attention_mask" in inputs:
@@ -260,6 +260,7 @@ class NITrainer(Seq2SeqTrainer):
             generation_inputs,
             **gen_kwargs,
         )
+        gen_kwargs["max_length"] = 512
         # in case the batch is shorter than max length, the output should be padded
         if generated_tokens.shape[-1] < gen_kwargs["max_length"]:
             generated_tokens = self._pad_tensors_to_max_len(generated_tokens, gen_kwargs["max_length"])
