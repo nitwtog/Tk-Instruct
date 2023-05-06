@@ -354,9 +354,9 @@ def main():
             revision = model_args.model_revision,
             use_auth_token = True if model_args.use_auth_token else None,
         )
-        tokenizer.bos_token = 1
-        tokenizer.eos_token = 2
-        tokenizer.pad_token = 1
+        tokenizer.bos_token_id = 1
+        tokenizer.eos_token_id = 2
+        tokenizer.pad_token_id = 1
     else:
         tokenizer = AutoTokenizer.from_pretrained(
             model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
